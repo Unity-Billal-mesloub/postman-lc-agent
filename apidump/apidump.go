@@ -15,7 +15,6 @@ import (
 	"github.com/akitasoftware/akita-libs/akid"
 	"github.com/akitasoftware/akita-libs/akiuri"
 	"github.com/akitasoftware/akita-libs/api_schema"
-	kgxapi "github.com/akitasoftware/akita-libs/api_schema"
 	"github.com/akitasoftware/akita-libs/buffer_pool"
 	"github.com/akitasoftware/akita-libs/tags"
 	"github.com/akitasoftware/go-utils/optionals"
@@ -58,9 +57,8 @@ const (
 
 	// Context timeout for telemetry upload
 	telemetryTimeout = 30 * time.Second
-)
 
-const (
+	// Delimiter for subcommand output
 	subcommandOutputDelimiter = "======= _POSTMAN_SUBCOMMAND_ ======="
 )
 
@@ -71,13 +69,21 @@ const (
 	notMatchedFilter filterState = "UNMATCHED"
 )
 
-var ProcessSignalErr = errors.New("process received exit signal")
+var (
+	ProcessSignalErr = errors.New("process received exit signal")
+
+	// Telemetry tracker for the apidump process
+	apidumpTelemetry telemetry.Tracker
+)
 
 // Args for running apidump as daemonset in Kubernetes
 type DaemonsetArgs struct {
 	TargetNetworkNamespaceOpt string
 	StopChan                  <-chan error `json:"-"`
 	APIKey                    string
+	WorkspaceID               string
+	ServiceEnvironment        string
+	ServiceName               string
 	Environment               string
 	TraceTags                 tags.SingletonTags
 }
@@ -151,10 +157,16 @@ type Args struct {
 	// Whether to enable repro mode and include request/response payloads when uploading witnesses.
 	ReproMode bool
 
+	// Always capture request and response payloads for the given paths.
+	AlwaysCapturePayloads []string
+
 	// Whether to drop traffic to/from nginx
 	DropNginxTraffic bool
 
 	DaemonsetArgs optionals.Optional[DaemonsetArgs]
+
+	// The number of upload buffers. Anything larger than 1 results in async uploads.
+	MaxWitnessUploadBuffers int
 }
 
 // TODO: either remove write-to-local-HAR-file completely,
@@ -186,10 +198,15 @@ func newSession(args *Args) *apidump {
 
 // Is the target the Akita backend as expected, or a local HAR file?
 func (a *apidump) TargetIsRemote() bool {
+	if daemonsetArgs, exists := a.DaemonsetArgs.Get(); exists {
+		if daemonsetArgs.WorkspaceID != "" {
+			return true
+		}
+	}
 	return a.Out.AkitaURI != nil || a.PostmanCollectionID != "" || a.ServiceID != akid.ServiceID{}
 }
 
-// Lookup the service and create a learn client targeting it.
+// Lookup the service, set up telemetry, and create a learn client targeting it.
 func (a *apidump) LookupService() error {
 	if !a.TargetIsRemote() {
 		return nil
@@ -201,7 +218,20 @@ func (a *apidump) LookupService() error {
 		authHandler = rest.ApiDumpDaemonsetAuthHandler(daemonsetArgs.APIKey, daemonsetArgs.Environment)
 	}
 
-	frontClient := rest.NewFrontClient(a.Domain, a.ClientID, authHandler)
+	// Set up telemetry for the apidump process.
+	if a.DaemonsetArgs.IsSome() {
+		frontClient := rest.NewFrontClient(a.Domain, a.ClientID, authHandler, nil)
+		trackingUser, err := telemetry.GetTrackingUserAssociatedWithAPIKey(frontClient)
+		if err != nil {
+			return err
+		}
+		apidumpTelemetry = telemetry.NewScoped(trackingUser)
+	} else {
+		apidumpTelemetry = telemetry.Default()
+	}
+
+	// Initialize new front client with telemetry APIError handler.
+	frontClient := rest.NewFrontClient(a.Domain, a.ClientID, authHandler, apidumpTelemetry.APIError)
 
 	if a.PostmanCollectionID != "" {
 		backendSvc, err := util.GetOrCreateServiceIDByPostmanCollectionID(frontClient, a.PostmanCollectionID)
@@ -212,16 +242,32 @@ func (a *apidump) LookupService() error {
 		a.backendSvc = backendSvc
 		a.backendSvcName = "Postman_Collection_" + a.PostmanCollectionID
 	} else {
-		serviceName, err := util.GetServiceNameByServiceID(frontClient, a.ServiceID)
-		if err != nil {
-			return err
-		}
+		daemonsetArgs, exists := a.DaemonsetArgs.Get()
+		if exists && daemonsetArgs.WorkspaceID != "" {
+			service, err := frontClient.CreateInsightsService(
+				context.Background(),
+				daemonsetArgs.WorkspaceID,
+				daemonsetArgs.ServiceName,
+				daemonsetArgs.ServiceEnvironment,
+			)
+			if err != nil {
+				return err
+			}
 
-		a.backendSvc = a.ServiceID
-		a.backendSvcName = serviceName
+			a.backendSvc = service.ID
+			a.backendSvcName = service.Name
+		} else {
+			serviceName, err := util.GetServiceNameByServiceID(frontClient, a.ServiceID)
+			if err != nil {
+				return err
+			}
+
+			a.backendSvc = a.ServiceID
+			a.backendSvcName = serviceName
+		}
 	}
 
-	a.learnClient = rest.NewLearnClient(a.Domain, a.ClientID, a.backendSvc, authHandler)
+	a.learnClient = rest.NewLearnClient(a.Domain, a.ClientID, a.backendSvc, authHandler, apidumpTelemetry.APIError)
 	return nil
 }
 
@@ -235,7 +281,7 @@ func (a *apidump) SendInitialTelemetry() {
 	// XXX(cns):  The observed duration serves as a key for upserting packet
 	//    telemetry, so it needs to be the same here as in the packet
 	//    telemetry sent 5 minutes after startup.
-	req := kgxapi.PostInitialClientTelemetryRequest{
+	req := api_schema.PostInitialClientTelemetryRequest{
 		ClientID:                  a.ClientID,
 		ObservedStartingAt:        a.startTime,
 		ObservedDurationInSeconds: 0,
@@ -261,13 +307,13 @@ func (a *apidump) SendInitialTelemetry() {
 	if err != nil {
 		// Log an error and continue.
 		printer.Stderr.Errorf("Failed to send initial telemetry statistics: %s\n", err)
-		telemetry.Error("telemetry", err)
+		apidumpTelemetry.Error("telemetry", err)
 	}
 }
 
 // Send a message to the backend indicating failure to start and a cause
 func (a *apidump) SendErrorTelemetry(errorType api_schema.ApidumpErrorType, err error) {
-	req := &kgxapi.PostClientPacketCaptureStatsRequest{
+	req := &api_schema.PostClientPacketCaptureStatsRequest{
 		ObservedDurationInSeconds: a.TelemetryInterval,
 		ApidumpError:              errorType,
 		ApidumpErrorText:          err.Error(),
@@ -283,7 +329,7 @@ func isBpfFilterError(e error) bool {
 
 // Update the backend with new current capture stats.
 func (a *apidump) SendPacketTelemetry(observationDuration int, windowStartTime time.Time, windowDuration int) {
-	req := &kgxapi.PostClientPacketCaptureStatsRequest{
+	req := &api_schema.PostClientPacketCaptureStatsRequest{
 		AgentResourceUsage:              usage.Get(),
 		ObservedDurationInSeconds:       observationDuration,
 		ObservedWindowStartingAt:        windowStartTime,
@@ -298,7 +344,7 @@ func (a *apidump) SendPacketTelemetry(observationDuration int, windowStartTime t
 }
 
 // Fill in the client ID and start time and send telemetry to the backend.
-func (a *apidump) SendTelemetry(req *kgxapi.PostClientPacketCaptureStatsRequest) {
+func (a *apidump) SendTelemetry(req *api_schema.PostClientPacketCaptureStatsRequest) {
 	// Do not send packet capture telemetry for local captures.
 	if !a.TargetIsRemote() {
 		return
@@ -313,7 +359,7 @@ func (a *apidump) SendTelemetry(req *kgxapi.PostClientPacketCaptureStatsRequest)
 	if err != nil {
 		// Log an error and continue.
 		printer.Stderr.Errorf("Failed to send telemetry statistics: %s\n", err)
-		telemetry.Error("telemetry", err)
+		apidumpTelemetry.Error("telemetry", err)
 	}
 }
 
@@ -444,7 +490,7 @@ func (a *apidump) RotateLearnSession(done <-chan struct{}, collectors []trace.Le
 			traceName := util.RandomLearnSessionName()
 			backendLrn, err := util.NewLearnSession(a.learnClient, traceName, traceTags, nil)
 			if err != nil {
-				telemetry.Error("new learn session", err)
+				apidumpTelemetry.Error("new learn session", err)
 				printer.Errorf("Failed to create trace %s: %v\n", traceName, err)
 				break
 			}
@@ -452,7 +498,7 @@ func (a *apidump) RotateLearnSession(done <-chan struct{}, collectors []trace.Le
 			for _, c := range collectors {
 				c.SwitchLearnSession(backendLrn)
 			}
-			telemetry.Success("rotate learn session")
+			apidumpTelemetry.Success("rotate learn session")
 		}
 	}
 }
@@ -743,13 +789,17 @@ func (a *apidump) Run() error {
 				if args.Out.AkitaURI != nil {
 					backendCollector = trace.NewBackendCollector(
 						a.backendSvc,
+						traceTags,
 						backendLrn,
 						a.learnClient,
 						redactor,
 						optionals.Some(a.MaxWitnessSize_bytes),
 						summary,
 						args.ReproMode,
+						optionals.Some(args.AlwaysCapturePayloads),
 						args.Plugins,
+						args.MaxWitnessUploadBuffers,
+						apidumpTelemetry,
 					)
 
 					collector = backendCollector
@@ -832,7 +882,20 @@ func (a *apidump) Run() error {
 			go func(interfaceName, filter string) {
 				defer doneWG.Done()
 				// Collect trace. This blocks until stop is closed or an error occurs.
-				if err := pcap.Collect(stop, interfaceName, filter, targetNetworkNamespace, bufferShare, args.ParseTLSHandshakes, collector, summary, pool); err != nil {
+				if err := pcap.Collect(
+					a.backendSvc,
+					traceTags,
+					stop,
+					interfaceName,
+					filter,
+					targetNetworkNamespace,
+					bufferShare,
+					args.ParseTLSHandshakes,
+					collector,
+					summary,
+					pool,
+					apidumpTelemetry,
+				); err != nil {
 					errChan <- interfaceError{
 						interfaceName: interfaceName,
 						err:           errors.Wrapf(err, "failed to collect trace on interface %s", interfaceName),
@@ -888,7 +951,7 @@ func (a *apidump) Run() error {
 
 		if cmdErr != nil {
 			subcmdErr = errors.Wrap(cmdErr, "failed to run subcommand")
-			telemetry.Error("subcommand", cmdErr)
+			apidumpTelemetry.Error("subcommand", cmdErr)
 
 			// We promised to preserve the subcommand's exit code.
 			// Explicitly notify whoever is running us to exit.
@@ -903,7 +966,7 @@ func (a *apidump) Run() error {
 			select {
 			case interfaceErr := <-errChan:
 				printer.Stderr.Errorf("Encountered errors while collecting traces, stopping...\n")
-				telemetry.Error("packet capture", interfaceErr.err)
+				apidumpTelemetry.Error("packet capture", interfaceErr.err)
 				errorsByInterface[interfaceErr.interfaceName] = interfaceErr.err
 
 				// Drain errChan.
@@ -944,7 +1007,7 @@ func (a *apidump) Run() error {
 				case interfaceErr := <-errChan:
 					errorsByInterface[interfaceErr.interfaceName] = interfaceErr.err
 
-					telemetry.Error("packet capture", interfaceErr.err)
+					apidumpTelemetry.Error("packet capture", interfaceErr.err)
 					if len(errorsByInterface) < numCollectors {
 						printer.Stderr.Errorf("Encountered an error on interface %s, continuing with remaining interfaces.  Error: %s\n", interfaceErr.interfaceName, interfaceErr.err.Error())
 					} else {
@@ -987,7 +1050,7 @@ func (a *apidump) Run() error {
 		// If collectors on all interfaces report errors, report trace
 		// collection failed.
 		if len(errorsByInterface) == numCollectors {
-			telemetry.Failure("all interfaces failed")
+			apidumpTelemetry.Failure("all interfaces failed")
 			return errors.Errorf("trace collection failed")
 		}
 	}
@@ -1001,7 +1064,7 @@ func (a *apidump) Run() error {
 	a.dumpSummary.PrintWarnings()
 
 	if a.dumpSummary.IsEmpty() {
-		telemetry.Failure("empty API trace")
+		apidumpTelemetry.Failure("empty API trace")
 	} else {
 		printer.Stderr.Infof("%s 🎉\n\n", printer.Color.Green("Success!"))
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/akitasoftware/akita-libs/tags"
 	"github.com/akitasoftware/go-utils/optionals"
 	"github.com/pkg/errors"
+	"github.com/postmanlabs/postman-insights-agent/apispec"
 	"github.com/postmanlabs/postman-insights-agent/architecture"
 	"github.com/postmanlabs/postman-insights-agent/data_masks"
 	"github.com/postmanlabs/postman-insights-agent/env"
@@ -159,13 +160,13 @@ func NewNginxBackend(args *Args) (*NginxBackend, error) {
 		startTime:  time.Now(),
 	}
 
-	frontClient := rest.NewFrontClient(args.Domain, args.ClientID, nil)
+	frontClient := rest.NewFrontClient(args.Domain, args.ClientID, nil, nil)
 	backendSvc, err := util.GetServiceIDByName(frontClient, args.ServiceName)
 	if err != nil {
 		return nil, err
 	}
 	b.backendSvc = backendSvc
-	b.learnClient = rest.NewLearnClient(args.Domain, args.ClientID, backendSvc, nil)
+	b.learnClient = rest.NewLearnClient(args.Domain, args.ClientID, backendSvc, nil, nil)
 
 	traceTags := map[tags.Key]string{
 		tags.XAkitaSource: "nginx",
@@ -185,13 +186,17 @@ func NewNginxBackend(args *Args) (*NginxBackend, error) {
 	b.summary = trace.NewPacketCounter()
 	b.collector = trace.NewBackendCollector(
 		b.backendSvc,
+		traceTags,
 		backendLrn,
 		b.learnClient,
 		redactor,
 		optionals.Some(args.MaxWitnessSize_bytes),
 		b.summary,
 		false,
+		optionals.None[[]string](),
 		args.Plugins,
+		apispec.DefaultMaxWintessUploadBuffers,
+		telemetry.Default(),
 	)
 
 	// TODO: rate-limit

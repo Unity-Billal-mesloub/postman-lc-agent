@@ -6,7 +6,9 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/akitasoftware/akita-libs/akid"
 	"github.com/akitasoftware/akita-libs/akinet"
+	"github.com/akitasoftware/akita-libs/tags"
 	"github.com/akitasoftware/go-utils/optionals"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -79,18 +81,24 @@ func (fact *tcpStreamFactory) New(netFlow, tcpFlow gopacket.Flow, _ *layers.TCP,
 type NetworkTrafficObserver func(gopacket.Packet)
 
 type NetworkTrafficParser struct {
+	serviceID   akid.ServiceID
+	traceTags   map[tags.Key]string
 	pcap        pcapWrapper
 	clock       clockWrapper
 	observer    NetworkTrafficObserver // This function is called for every packet.
 	bufferShare float32
+	telemetry   telemetry.Tracker
 }
 
-func NewNetworkTrafficParser(bufferShare float32) *NetworkTrafficParser {
+func NewNetworkTrafficParser(serviceID akid.ServiceID, traceTags map[tags.Key]string, bufferShare float32, telemetry telemetry.Tracker) *NetworkTrafficParser {
 	return &NetworkTrafficParser{
-		pcap:        &pcapImpl{},
+		serviceID:   serviceID,
+		traceTags:   traceTags,
+		pcap:        &pcapImpl{serviceID, traceTags},
 		clock:       &realClock{},
 		observer:    func(gopacket.Packet) {},
 		bufferShare: bufferShare,
+		telemetry:   telemetry,
 	}
 }
 
@@ -140,6 +148,9 @@ func (p *NetworkTrafficParser) ParseFromInterface(
 		// Signal caller that we're done on exit
 		defer close(out)
 
+		startTime := time.Now()
+		bufferTimeSum := 0 * time.Second
+		intervalLength := 1 * time.Minute
 		for {
 			select {
 			// packets channel is going to read until EOF or when signalClose is
@@ -158,6 +169,20 @@ func (p *NetworkTrafficParser) ParseFromInterface(
 
 					return
 				}
+
+				now := time.Now()
+				if now.Sub(startTime) >= intervalLength {
+					bufferLength := float64(bufferTimeSum.Nanoseconds()) / float64(intervalLength.Nanoseconds())
+					podName, ok := p.traceTags[tags.XAkitaKubernetesPod]
+					if !ok {
+						podName = "unknown"
+					}
+					printer.Debugf("Approximate unprocessed-packets buffer length: %v for svc: %v and pod: %v\n", bufferLength, p.serviceID, podName)
+					bufferTimeSum = 0 * time.Second
+					startTime = now
+				}
+				bufferTimeSum += now.Sub(packet.Metadata().Timestamp)
+
 				p.observer(packet)
 				p.packetToParsedNetworkTraffic(out, assembler, packet)
 			case <-ticker.C:
@@ -204,9 +229,9 @@ func (p *NetworkTrafficParser) packetToParsedNetworkTraffic(out chan<- akinet.Pa
 		// TODO: detect repeated crashes?
 		if err := recover(); err != nil {
 			if e, ok := err.(error); ok {
-				telemetry.RateLimitError("packet handling", e)
+				p.telemetry.RateLimitError("packet handling", e)
 			} else {
-				telemetry.RateLimitError("packet handling", fmt.Errorf("%v", err))
+				p.telemetry.RateLimitError("packet handling", fmt.Errorf("%v", err))
 			}
 			printer.Stderr.Errorf("Panic during packet handling: %v\n%v\n", err, string(debug.Stack()))
 		}

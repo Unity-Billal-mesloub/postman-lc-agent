@@ -14,9 +14,9 @@ import (
 	"github.com/akitasoftware/akita-libs/akinet"
 	kgxapi "github.com/akitasoftware/akita-libs/api_schema"
 	"github.com/akitasoftware/akita-libs/batcher"
-	"github.com/akitasoftware/akita-libs/http_rest_methods"
 	"github.com/akitasoftware/akita-libs/spec_util"
 	"github.com/akitasoftware/akita-libs/spec_util/ir_hash"
+	"github.com/akitasoftware/akita-libs/tags"
 	"github.com/akitasoftware/go-utils/optionals"
 	"github.com/akitasoftware/go-utils/sets"
 	"github.com/golang/protobuf/proto"
@@ -34,10 +34,10 @@ const (
 	pairCacheExpiration = time.Minute
 
 	// How often we clean out stale partial witnesses from pairCache.
-	pairCacheCleanupInterval = 30 * time.Second
+	pairCacheCleanupInterval = 5 * time.Second
 
 	// Max size per upload batch.
-	uploadBatchMaxSize_bytes = 60_000_000 // 60 MB
+	uploadBatchMaxSize_bytes = 30_000_000 // 30 MB
 
 	// How often to flush the upload batch.
 	uploadBatchFlushDuration = 5 * time.Second
@@ -138,6 +138,7 @@ type LearnSessionCollector interface {
 // Sends witnesses up to akita cloud.
 type BackendCollector struct {
 	serviceID      akid.ServiceID
+	traceTags      map[tags.Key]string
 	learnSessionID akid.LearnSessionID
 	learnClient    rest.LearnClient
 
@@ -158,35 +159,60 @@ type BackendCollector struct {
 	// obfuscated before being sent to the back end.
 	sendWitnessPayloads bool
 
+	// Always capture request and response payloads for the given paths.
+	alwaysCapturePayloadsPathsRegex []*regexp.Regexp
+
 	plugins []plugin.AkitaPlugin
 
 	redactor *data_masks.Redactor
+
+	telemetry telemetry.Tracker
 }
 
 var _ LearnSessionCollector = (*BackendCollector)(nil)
 
 func NewBackendCollector(
 	svc akid.ServiceID,
+	traceTags map[tags.Key]string,
 	lrn akid.LearnSessionID,
 	lc rest.LearnClient,
 	redactor *data_masks.Redactor,
 	maxWitnessSize_bytes optionals.Optional[int],
 	packetCounts PacketCountConsumer,
 	sendWitnessPayloads bool,
+	alwaysCapturePayloads optionals.Optional[[]string],
 	plugins []plugin.AkitaPlugin,
+	uploadReportBuffers int,
+	telemetry telemetry.Tracker,
 ) Collector {
-	col := &BackendCollector{
-		serviceID:           svc,
-		learnSessionID:      lrn,
-		learnClient:         lc,
-		flushDone:           make(chan struct{}),
-		plugins:             plugins,
-		sendWitnessPayloads: sendWitnessPayloads,
-		redactor:            redactor,
+	// Compile the regexps for the always capture payloads.
+	alwaysCapturePayloadsPathsRegex := []*regexp.Regexp{}
+	if paths, exists := alwaysCapturePayloads.Get(); exists {
+		for _, path := range paths {
+			reg, err := regexp.Compile(path)
+			if err != nil {
+				printer.Errorf("Invalid regex %s: %v", path, err)
+				continue
+			}
+			alwaysCapturePayloadsPathsRegex = append(alwaysCapturePayloadsPathsRegex, reg)
+		}
 	}
 
-	col.uploadReportBatch = batcher.NewInMemory[rawReport](
-		newReportBuffer(col, packetCounts, uploadBatchMaxSize_bytes, maxWitnessSize_bytes, sendWitnessPayloads),
+	col := &BackendCollector{
+		serviceID:                       svc,
+		traceTags:                       traceTags,
+		learnSessionID:                  lrn,
+		learnClient:                     lc,
+		flushDone:                       make(chan struct{}),
+		plugins:                         plugins,
+		sendWitnessPayloads:             sendWitnessPayloads,
+		alwaysCapturePayloadsPathsRegex: alwaysCapturePayloadsPathsRegex,
+		redactor:                        redactor,
+		telemetry:                       telemetry,
+	}
+
+	col.uploadReportBatch = batcher.NewInMemory(
+		newReportBuffer(col, packetCounts, uploadBatchMaxSize_bytes, maxWitnessSize_bytes, sendWitnessPayloads, uploadReportBuffers),
 		uploadBatchFlushDuration,
 	)
 
@@ -215,7 +241,7 @@ func (c *BackendCollector) Process(t akinet.ParsedNetworkTraffic) error {
 	}
 
 	if parseHTTPErr != nil {
-		telemetry.RateLimitError("parse HTTP", parseHTTPErr)
+		c.telemetry.RateLimitError("parse HTTP", parseHTTPErr)
 		printer.Debugf("Failed to parse HTTP, skipping: %v\n", parseHTTPErr)
 		return nil
 	}
@@ -319,41 +345,6 @@ func init() {
 	}
 }
 
-// Returns true if the witness should be excluded from Repro Mode.
-//
-// XXX This is a stop-gap hack to exclude certain endpoints for Cloud API from
-// Repro Mode.
-func excludeWitnessFromReproMode(w *pb.Witness) bool {
-	httpMeta := w.GetMethod().GetMeta().GetHttp()
-	if httpMeta == nil {
-		return false
-	}
-
-	if cloudAPIHostnames.Contains(strings.ToLower(httpMeta.Host)) {
-		switch httpMeta.Method {
-		case http_rest_methods.GET.String():
-			// Exclude GET /environments/{environment}.
-			if cloudAPIEnvironmentsPathRE.MatchString(httpMeta.PathTemplate) {
-				return true
-			}
-
-		case http_rest_methods.POST.String():
-			// Exclude POST /environments.
-			if httpMeta.PathTemplate == "/environments" {
-				return true
-			}
-
-		case http_rest_methods.PUT.String():
-			// Exclude PUT /environments/{environment}.
-			// Exclude GET /environments/{environment}.
-			if cloudAPIEnvironmentsPathRE.MatchString(httpMeta.PathTemplate) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (c *BackendCollector) queueUpload(w *witnessWithInfo) {
 	if w.witnessFlushed {
 		printer.Debugf("Witness %v already flushed.\n", w.id)
@@ -375,8 +366,7 @@ func (c *BackendCollector) queueUpload(w *witnessWithInfo) {
 	}
 
 	if !c.sendWitnessPayloads ||
-		!hasOnlyErrorResponses(w.witness.GetMethod()) ||
-		excludeWitnessFromReproMode(w.witness) {
+		!shouldCapturePayload(w.witness, c.alwaysCapturePayloadsPathsRegex) {
 		// Obfuscate the original value so type inference engine can use it on the
 		// backend without revealing the actual value.
 		c.redactor.ZeroAllPrimitives(w.witness.GetMethod())
@@ -424,6 +414,8 @@ func (c *BackendCollector) periodicFlush() {
 }
 
 func (c *BackendCollector) flushPairCache(cutoffTime time.Time) {
+	totalWitnesses := 0
+	flushedWitnesses := 0
 	c.pairCache.Range(func(k, v interface{}) bool {
 		e := v.(*witnessWithInfo)
 		if e.observationTime.Before(cutoffTime) {
@@ -434,7 +426,15 @@ func (c *BackendCollector) flushPairCache(cutoffTime time.Time) {
 
 			c.queueUpload(e)
 			c.pairCache.Delete(k)
+
+			flushedWitnesses += 1
 		}
+		totalWitnesses += 1
 		return true
 	})
+	podName, ok := c.traceTags[tags.XAkitaKubernetesPod]
+	if !ok {
+		podName = "unknown"
+	}
+	printer.Debugf("flushed-witnesses in cache: %v, total-witnesses in cache: %v for svc: %v and pod: %v\n", flushedWitnesses, totalWitnesses, c.serviceID, podName)
 }

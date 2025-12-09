@@ -17,12 +17,15 @@ import (
 	"github.com/akitasoftware/akita-libs/batcher"
 	"github.com/akitasoftware/akita-libs/memview"
 	"github.com/akitasoftware/akita-libs/spec_util"
+	"github.com/akitasoftware/akita-libs/tags"
 	"github.com/akitasoftware/go-utils/optionals"
 	"github.com/golang/mock/gomock"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
+	"github.com/postmanlabs/postman-insights-agent/apispec"
 	"github.com/postmanlabs/postman-insights-agent/data_masks"
 	mockrest "github.com/postmanlabs/postman-insights-agent/rest"
+	"github.com/postmanlabs/postman-insights-agent/telemetry"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -34,7 +37,13 @@ var (
 var redactionString = data_masks.RedactionString
 
 type witnessRecorder struct {
-	witnesses []*pb.Witness
+	witnesses chan *pb.Witness
+}
+
+func newWitnessRecorder() *witnessRecorder {
+	return &witnessRecorder{
+		witnesses: make(chan *pb.Witness, 100), // making the channel size large to prevent dead-locking the main test co-routine
+	}
 }
 
 // Record a call to LearnClient.AsyncReportsUpload
@@ -50,7 +59,29 @@ func (wr *witnessRecorder) recordAsyncReportsUpload(args ...interface{}) {
 		if err := proto.Unmarshal(bs, w); err != nil {
 			panic(err)
 		}
-		wr.witnesses = append(wr.witnesses, w)
+		wr.witnesses <- w
+	}
+}
+
+func (wr *witnessRecorder) assertExpectedWitnesses(t *testing.T, expectedWitnesses []*pb.Witness) {
+	for i := range expectedWitnesses {
+		expected := proto.MarshalTextString(expectedWitnesses[i])
+		actual := proto.MarshalTextString(<-wr.witnesses)
+		assert.Equal(t, expected, actual)
+	}
+}
+
+func (wr *witnessRecorder) assertExpectedWitnessLatency(t *testing.T, expectedWitnesses int, expectedLatencies []float32) {
+	witnesses := make([]*pb.Witness, 0)
+	for range expectedWitnesses {
+		witnesses = append(witnesses, <-wr.witnesses)
+	}
+	assert.Equal(t, expectedWitnesses, len(witnesses))
+	for i, expectedLatency := range expectedLatencies {
+		witness := witnesses[i]
+		meta := spec_util.HTTPMetaFromMethod(witness.Method)
+		assert.NotNil(t, meta)
+		assert.InDelta(t, expectedLatency, meta.ProcessingLatency, 0.001)
 	}
 }
 
@@ -60,7 +91,7 @@ func TestRedact(t *testing.T) {
 	mockClient := mockrest.NewMockLearnClient(ctrl)
 	defer ctrl.Finish()
 
-	var rec witnessRecorder
+	rec := newWitnessRecorder()
 	mockClient.
 		EXPECT().
 		AsyncReportsUpload(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -108,13 +139,17 @@ func TestRedact(t *testing.T) {
 
 	col := NewBackendCollector(
 		fakeSvc,
+		map[tags.Key]string{},
 		fakeLrn,
 		mockClient,
 		redactor,
 		optionals.None[int](),
 		NewPacketCounter(),
 		false,
+		optionals.None[[]string](),
 		nil,
+		apispec.DefaultMaxWintessUploadBuffers,
+		telemetry.Default(),
 	)
 	assert.NoError(t, col.Process(req))
 	assert.NoError(t, col.Process(resp))
@@ -155,11 +190,7 @@ func TestRedact(t *testing.T) {
 		},
 	}
 
-	for i := range expectedWitnesses {
-		expected := proto.MarshalTextString(expectedWitnesses[i])
-		actual := proto.MarshalTextString(rec.witnesses[i])
-		assert.Equal(t, expected, actual)
-	}
+	rec.assertExpectedWitnesses(t, expectedWitnesses)
 }
 
 func dataFromPrimitive(p *pb.Primitive) *pb.Data {
@@ -440,7 +471,7 @@ func TestTiming(t *testing.T) {
 			mockClient := mockrest.NewMockLearnClient(ctrl)
 			defer ctrl.Finish()
 
-			var rec witnessRecorder
+			rec := newWitnessRecorder()
 			mockClient.
 				EXPECT().
 				AsyncReportsUpload(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -459,26 +490,24 @@ func TestTiming(t *testing.T) {
 
 			col := NewBackendCollector(
 				fakeSvc,
+				map[tags.Key]string{},
 				fakeLrn,
 				mockClient,
 				redactor,
 				optionals.None[int](),
 				NewPacketCounter(),
 				false,
+				optionals.None[[]string](),
 				nil,
+				apispec.DefaultMaxWintessUploadBuffers,
+				telemetry.Default(),
 			)
 			for _, pnt := range test.PNTs {
 				assert.NoError(t, col.Process(pnt))
 			}
 			assert.NoError(t, col.Close())
 
-			assert.Equal(t, test.ExpectedWitnesses, len(rec.witnesses))
-			for i, expectedLatency := range test.ExpectedLatencies {
-				witness := rec.witnesses[i]
-				meta := spec_util.HTTPMetaFromMethod(witness.Method)
-				assert.NotNil(t, meta)
-				assert.InDelta(t, expectedLatency, meta.ProcessingLatency, 0.001)
-			}
+			rec.assertExpectedWitnessLatency(t, test.ExpectedWitnesses, test.ExpectedLatencies)
 		})
 	}
 }
@@ -503,13 +532,17 @@ func TestMultipleInterfaces(t *testing.T) {
 
 	bc := NewBackendCollector(
 		fakeSvc,
+		map[tags.Key]string{},
 		fakeLrn,
 		mockClient,
 		redactor,
 		optionals.None[int](),
 		NewPacketCounter(),
 		false,
+		optionals.None[[]string](),
 		nil,
+		apispec.DefaultMaxWintessUploadBuffers,
+		telemetry.Default(),
 	)
 
 	var wg sync.WaitGroup
@@ -559,8 +592,8 @@ func TestMultipleInterfaces(t *testing.T) {
 // Demonstrate that periodic flush exits
 func TestFlushExit(t *testing.T) {
 	b := &BackendCollector{}
-	b.uploadReportBatch = batcher.NewInMemory[rawReport](
-		newReportBuffer(b, NewPacketCounter(), uploadBatchMaxSize_bytes, optionals.None[int](), false),
+	b.uploadReportBatch = batcher.NewInMemory(
+		newReportBuffer(b, NewPacketCounter(), uploadBatchMaxSize_bytes, optionals.None[int](), false, apispec.DefaultMaxWintessUploadBuffers),
 		uploadBatchFlushDuration,
 	)
 	b.flushDone = make(chan struct{})
@@ -574,7 +607,7 @@ func TestOnlyRedactNonErrorResponses(t *testing.T) {
 	mockClient := mockrest.NewMockLearnClient(ctrl)
 	defer ctrl.Finish()
 
-	var rec witnessRecorder
+	rec := newWitnessRecorder()
 	mockClient.
 		EXPECT().
 		AsyncReportsUpload(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -651,13 +684,17 @@ func TestOnlyRedactNonErrorResponses(t *testing.T) {
 
 	col := NewBackendCollector(
 		fakeSvc,
+		map[tags.Key]string{},
 		fakeLrn,
 		mockClient,
 		redactor,
 		optionals.None[int](),
 		NewPacketCounter(),
 		true,
+		optionals.None[[]string](),
 		nil,
+		apispec.DefaultMaxWintessUploadBuffers,
+		telemetry.Default(),
 	)
 	assert.NoError(t, col.Process(req))
 	assert.NoError(t, col.Process(resp))
@@ -732,11 +769,179 @@ func TestOnlyRedactNonErrorResponses(t *testing.T) {
 		},
 	}
 
-	for i := range expectedWitnesses {
-		expected := proto.MarshalTextString(expectedWitnesses[i])
-		actual := proto.MarshalTextString(rec.witnesses[i])
-		assert.Equal(t, expected, actual)
+	rec.assertExpectedWitnesses(t, expectedWitnesses)
+}
+
+func TestAlwaysCapturePayloads(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockClient := mockrest.NewMockLearnClient(ctrl)
+	defer ctrl.Finish()
+
+	rec := newWitnessRecorder()
+	mockClient.
+		EXPECT().
+		AsyncReportsUpload(gomock.Any(), gomock.Any(), gomock.Any()).
+		Do(rec.recordAsyncReportsUpload).
+		AnyTimes().
+		Return(nil)
+
+	mockClient.
+		EXPECT().
+		GetDynamicAgentConfigForService(gomock.Any(), gomock.Any()).
+		AnyTimes().
+		Return(kgxapi.NewServiceAgentConfig(), nil)
+
+	streamID := uuid.New()
+	reqWithCapturePayloadPath := akinet.ParsedNetworkTraffic{
+		Content: akinet.HTTPRequest{
+			StreamID: streamID,
+			Seq:      1203,
+			Method:   "POST",
+			URL: &url.URL{
+				Path: "/v1/doggos",
+			},
+			Host: "example.com",
+			Header: map[string][]string{
+				"Content-Type":       {"application/json"},
+				"x-portkey-metadata": {`{"custom_postot_conversation_id":"12345678-1234-b1234-1234-123456789012","custom_postot_interaction_id":"12345678-1234-b1234-1234-123456789012","_prompt":"agent_system","_agent":"Root","_workflow":"agent_mode_chat","_domain":"agent_mode","_environment":"beta","_user":"916b323","_nrTraceId":"0d495a1379560f5d14f7f9c43d57bb07","_organization":"1"}`},
+			},
+			Body: memview.New([]byte(`{"name": "prince", "number": 6119717375543385000}`)),
+		},
 	}
+
+	respWithCapturePayloadPath := akinet.ParsedNetworkTraffic{
+		Content: akinet.HTTPResponse{
+			StreamID:   streamID,
+			Seq:        1203,
+			StatusCode: 200,
+			Header: map[string][]string{
+				"Content-Type": {"application/json"},
+			},
+			Body: memview.New([]byte(`{"homes": ["burbank, ca", "jeuno, ak", "versailles"]}`)),
+		},
+	}
+
+	streamID2 := uuid.New()
+	reqWithoutCapturePayloadPath := akinet.ParsedNetworkTraffic{
+		Content: akinet.HTTPRequest{
+			StreamID: streamID2,
+			Seq:      1203,
+			Method:   "POST",
+			URL: &url.URL{
+				Path: "/v1/do-not-capture",
+			},
+			Host: "example.com",
+			Header: map[string][]string{
+				"Content-Type": {"application/json"},
+			},
+			Body: memview.New([]byte(`{"name": "prince", "number": 6119717375543385000}`)),
+		},
+	}
+
+	respWithoutCapturePayloadPath := akinet.ParsedNetworkTraffic{
+		Content: akinet.HTTPResponse{
+			StreamID:   streamID2,
+			Seq:        1203,
+			StatusCode: 200,
+			Header: map[string][]string{
+				"Content-Type": {"application/json"},
+			},
+			Body: memview.New([]byte(`{"homes": ["burbank, ca", "jeuno, ak", "versailles"]}`)),
+		},
+	}
+
+	redactor, err := data_masks.NewRedactor(fakeSvc, mockClient)
+	assert.NoError(t, err)
+
+	col := NewBackendCollector(
+		fakeSvc,
+		map[tags.Key]string{},
+		fakeLrn,
+		mockClient,
+		redactor,
+		optionals.None[int](),
+		NewPacketCounter(),
+		true,
+		optionals.Some([]string{"/v1/doggos"}),
+		nil,
+		apispec.DefaultMaxWintessUploadBuffers,
+		telemetry.Default(),
+	)
+	assert.NoError(t, col.Process(reqWithCapturePayloadPath))
+	assert.NoError(t, col.Process(respWithCapturePayloadPath))
+	assert.NoError(t, col.Process(reqWithoutCapturePayloadPath))
+	assert.NoError(t, col.Process(respWithoutCapturePayloadPath))
+	assert.NoError(t, col.Close())
+
+	expectedWitnesses := []*pb.Witness{
+		{
+			Method: &pb.Method{
+				Id: &pb.MethodID{
+					ApiType: pb.ApiType_HTTP_REST,
+				},
+				Args: map[string]*pb.Data{
+					"27YhIi6o-7o=": newTestHeaderSpec(dataFromPrimitive(spec_util.NewPrimitiveString(`{"custom_postot_conversation_id":"12345678-1234-b1234-1234-123456789012","custom_postot_interaction_id":"12345678-1234-b1234-1234-123456789012","_prompt":"agent_system","_agent":"Root","_workflow":"agent_mode_chat","_domain":"agent_mode","_environment":"beta","_user":"916b323","_nrTraceId":"0d495a1379560f5d14f7f9c43d57bb07","_organization":"1"}`)), "x-portkey-metadata", 0),
+					"nxnOc5Qy3D4=": newTestBodySpecFromStruct(0, pb.HTTPBody_JSON, "application/json", map[string]*pb.Data{
+						"name":   dataFromPrimitive(spec_util.NewPrimitiveString("prince")),
+						"number": dataFromPrimitive(spec_util.NewPrimitiveInt64(6119717375543385000)),
+					}),
+				},
+				Responses: map[string]*pb.Data{
+					"AyBUQkT0SHU=": newTestBodySpecFromStruct(200, pb.HTTPBody_JSON, "application/json", map[string]*pb.Data{
+						"homes": dataFromList(
+							dataFromPrimitive(spec_util.NewPrimitiveString("burbank, ca")),
+							dataFromPrimitive(spec_util.NewPrimitiveString("jeuno, ak")),
+							dataFromPrimitive(spec_util.NewPrimitiveString("versailles")),
+						),
+					}),
+				},
+				Meta: &pb.MethodMeta{
+					Meta: &pb.MethodMeta_Http{
+						Http: &pb.HTTPMethodMeta{
+							Method:       "POST",
+							PathTemplate: "/v1/doggos",
+							Host:         "example.com",
+							Obfuscation:  pb.HTTPMethodMeta_NONE,
+						},
+					},
+				},
+			},
+		},
+		{
+			Method: &pb.Method{
+				Id: &pb.MethodID{
+					ApiType: pb.ApiType_HTTP_REST,
+				},
+				Args: map[string]*pb.Data{
+					"nxnOc5Qy3D4=": newTestBodySpecFromStruct(0, pb.HTTPBody_JSON, "application/json", map[string]*pb.Data{
+						"name":   dataFromPrimitive(spec_util.NewPrimitiveString("")),
+						"number": dataFromPrimitive(spec_util.NewPrimitiveInt64(0)),
+					}),
+				},
+				Responses: map[string]*pb.Data{
+					"AyBUQkT0SHU=": newTestBodySpecFromStruct(200, pb.HTTPBody_JSON, "application/json", map[string]*pb.Data{
+						"homes": dataFromList(
+							dataFromPrimitive(spec_util.NewPrimitiveString("")),
+							dataFromPrimitive(spec_util.NewPrimitiveString("")),
+							dataFromPrimitive(spec_util.NewPrimitiveString("")),
+						),
+					}),
+				},
+				Meta: &pb.MethodMeta{
+					Meta: &pb.MethodMeta_Http{
+						Http: &pb.HTTPMethodMeta{
+							Method:       "POST",
+							PathTemplate: "/v1/do-not-capture",
+							Host:         "example.com",
+							Obfuscation:  pb.HTTPMethodMeta_ZERO_VALUE,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	rec.assertExpectedWitnesses(t, expectedWitnesses)
 }
 
 func TestRedactionConfigs(t *testing.T) {
@@ -1444,7 +1649,7 @@ func TestRedactionConfigs(t *testing.T) {
 	mockClient := mockrest.NewMockLearnClient(ctrl)
 	defer ctrl.Finish()
 
-	var rec witnessRecorder
+	rec := newWitnessRecorder()
 	mockClient.
 		EXPECT().
 		AsyncReportsUpload(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -1471,20 +1676,22 @@ func TestRedactionConfigs(t *testing.T) {
 
 		col := NewBackendCollector(
 			fakeSvc,
+			map[tags.Key]string{},
 			fakeLrn,
 			mockClient,
 			redactor,
 			optionals.None[int](),
 			NewPacketCounter(),
 			true,
+			optionals.None[[]string](),
 			nil,
+			apispec.DefaultMaxWintessUploadBuffers,
+			telemetry.Default(),
 		)
 		assert.NoError(t, col.Process(req))
 		assert.NoError(t, col.Process(resp))
 		assert.NoError(t, col.Close())
 
-		expected := proto.MarshalTextString(testCase.expectedWitnesses)
-		actual := proto.MarshalTextString(rec.witnesses[i])
-		assert.Equal(t, expected, actual)
+		rec.assertExpectedWitnesses(t, []*pb.Witness{testCase.expectedWitnesses})
 	}
 }

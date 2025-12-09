@@ -39,6 +39,7 @@ var (
 	collectTCPAndTLSReports bool
 	parseTLSHandshakes      bool
 	maxWitnessSize_bytes    int
+	maxWitnessUploadBuffers int
 	dockerExtensionMode     bool
 	healthCheckPort         int
 
@@ -112,7 +113,7 @@ func apidumpRunWithoutAbnormalExit(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func apidumpRunInternal(cmd *cobra.Command, _ []string) error {
+func apidumpRunInternal(_ *cobra.Command, _ []string) error {
 	applyRandomizedStart()
 
 	traceTags, err := util.ParseTagsAndWarn(tagsFlag)
@@ -234,12 +235,16 @@ func apidumpRunInternal(cmd *cobra.Command, _ []string) error {
 		CollectTCPAndTLSReports: collectTCPAndTLSReports,
 		ParseTLSHandshakes:      parseTLSHandshakes,
 		MaxWitnessSize_bytes:    maxWitnessSize_bytes,
+		MaxWitnessUploadBuffers: maxWitnessUploadBuffers,
 		DockerExtensionMode:     dockerExtensionMode,
 		HealthCheckPort:         healthCheckPort,
 		DropNginxTraffic:        viper.GetBool("drop-nginx-traffic"),
 
 		// TODO: remove the SendWitnessPayloads flag once all existing users are migrated to new flag.
 		ReproMode: commonApidumpFlags.EnableReproMode || commonApidumpFlags.SendWitnessPayloads,
+
+		// TODO: Add this flag in kube run command to fetch from service env vars
+		AlwaysCapturePayloads: commonApidumpFlags.AlwaysCapturePayloads,
 	}
 	if err := apidump.Run(args); err != nil {
 		return cmderr.AkitaErr{Err: err}
@@ -365,6 +370,14 @@ func init() {
 		"Don't send witnesses larger than this.",
 	)
 	Cmd.Flags().MarkHidden("max-witness-size-bytes")
+
+	Cmd.Flags().IntVar(
+		&maxWitnessUploadBuffers,
+		"max-witness-upload-buffers",
+		apispec.DefaultMaxWintessUploadBuffers,
+		"Controls the numbers of witness upload buffers.",
+	)
+	Cmd.Flags().MarkHidden("max-witness-upload-buffers")
 
 	Cmd.Flags().BoolVar(
 		&dockerExtensionMode,

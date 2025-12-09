@@ -3,7 +3,6 @@ package rest
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"path"
 	"strconv"
@@ -16,16 +15,16 @@ import (
 )
 
 type learnClientImpl struct {
-	BaseClient
+	*BaseClient
 
 	serviceID akid.ServiceID
 }
 
 var _ LearnClient = (*learnClientImpl)(nil)
 
-func NewLearnClient(host string, cli akid.ClientID, svc akid.ServiceID, authHandler func(*http.Request) error) *learnClientImpl {
+func NewLearnClient(host string, cli akid.ClientID, svc akid.ServiceID, authHandler AuthHandler, apiErrorHandler APIErrorHandler) *learnClientImpl {
 	return &learnClientImpl{
-		BaseClient: NewBaseClient(host, cli, authHandler),
+		BaseClient: NewBaseClient(host, cli, authHandler, apiErrorHandler),
 		serviceID:  svc,
 	}
 }
@@ -224,8 +223,7 @@ func (c *learnClientImpl) PostInitialClientTelemetry(ctx context.Context, servic
 
 // Deprecated: Used in setversion command which is deprecated.
 func (c *learnClientImpl) SetSpecVersion(ctx context.Context, specID akid.APISpecID, versionName string) error {
-	resp := struct {
-	}{}
+	resp := struct{}{}
 	path := fmt.Sprintf("/v1/services/%s/spec-versions/%s",
 		akid.String(c.serviceID), versionName)
 	req := kgxapi.SetSpecVersionRequest{

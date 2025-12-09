@@ -56,7 +56,6 @@ func (d *Daemonset) StartApiDumpProcess(podUID types.UID) error {
 			if err != nil {
 				printer.Errorf("Failed to change pod state, pod name: %s, from: %s to: %s, error: %v\n",
 					podArgs.PodName, podArgs.PodTrafficMonitorState, nextState, err)
-				return
 			}
 		}()
 
@@ -64,7 +63,7 @@ func (d *Daemonset) StartApiDumpProcess(podUID types.UID) error {
 		if err != nil {
 			funcErr = errors.Errorf("Failed to get network namespace for pod/containerUUID: %s/%s, err: %v",
 				podArgs.PodName, podArgs.ContainerUUID, err)
-			return
+			return funcErr
 		}
 		// Prepend '/host' to network namespace, since '/proc' folder is mounted to '/host/proc'
 		networkNamespace = "/host" + networkNamespace
@@ -83,28 +82,33 @@ func (d *Daemonset) StartApiDumpProcess(podUID types.UID) error {
 			MaxWitnessSize_bytes:    apispec.DefaultMaxWitnessSize_bytes,
 			ReproMode:               podArgs.ReproMode,
 			DropNginxTraffic:        podArgs.DropNginxTraffic,
+			MaxWitnessUploadBuffers: apispec.DefaultMaxWintessUploadBuffers,
+			AlwaysCapturePayloads:   podArgs.AlwaysCapturePayloads,
 			DaemonsetArgs: optionals.Some(apidump.DaemonsetArgs{
 				TargetNetworkNamespaceOpt: networkNamespace,
 				StopChan:                  podArgs.StopChan,
 				APIKey:                    podArgs.PodCreds.InsightsAPIKey,
 				Environment:               podArgs.PodCreds.InsightsEnvironment,
 				TraceTags:                 podArgs.TraceTags,
+				ServiceName:               podArgs.PodCreds.InsightsServiceName,
+				ServiceEnvironment:        podArgs.PodCreds.InsightsServiceEnvironment,
+				WorkspaceID:               podArgs.PodCreds.InsightsWorkspaceID,
 			}),
 		}
 
 		if err := apidump.Run(apidumpArgs); err != nil {
 			funcErr = errors.Wrapf(err, "failed to run apidump process for pod %s", podArgs.PodName)
 		}
-		return
+		return funcErr
 	}()
 
 	return nil
 }
 
-// StopApiDumpProcess signals the API dump process to stop for a given pod
+// SignalApiDumpProcessToStop signals the API dump process to stop for a given pod
 // identified by its UID. It retrieves the process's stop channel object from a map
 // and sends a stop signal to trigger apidump shutdown.
-func (d *Daemonset) StopApiDumpProcess(podUID types.UID, stopErr error) error {
+func (d *Daemonset) SignalApiDumpProcessToStop(podUID types.UID, stopErr error) error {
 	podArgs, err := d.getPodArgsFromMap(podUID)
 	if err != nil {
 		return err
@@ -112,7 +116,6 @@ func (d *Daemonset) StopApiDumpProcess(podUID types.UID, stopErr error) error {
 
 	printer.Infof("Stopping API dump process for pod %s\n", podArgs.PodName)
 	podArgs.StopChan <- stopErr
-	close(podArgs.StopChan)
 
 	return nil
 }

@@ -2,7 +2,6 @@ package rest
 
 import (
 	"context"
-	"net/http"
 	"path"
 
 	"github.com/akitasoftware/akita-libs/akid"
@@ -11,14 +10,14 @@ import (
 )
 
 type frontClientImpl struct {
-	BaseClient
+	*BaseClient
 }
 
 var _ FrontClient = (*frontClientImpl)(nil)
 
-func NewFrontClient(host string, cli akid.ClientID, authHandler func(*http.Request) error) *frontClientImpl {
+func NewFrontClient(host string, cli akid.ClientID, authHandler AuthHandler, apiErrorHandler APIErrorHandler) *frontClientImpl {
 	return &frontClientImpl{
-		BaseClient: NewBaseClient(host, cli, authHandler),
+		BaseClient: NewBaseClient(host, cli, authHandler, apiErrorHandler),
 	}
 }
 
@@ -38,6 +37,22 @@ func (c *frontClientImpl) GetService(ctx context.Context, serviceID akid.Service
 		return InsightsService{}, err
 	}
 	return resp, nil
+}
+
+func (c *frontClientImpl) CreateInsightsService(ctx context.Context, workspaceID string, serviceName string, serviceEnvironment string) (CreateInsightsServiceResponse, error) {
+	var resp CreateInsightsServiceResponse
+	p := path.Join("v2/agent/workspaces", workspaceID, "services")
+
+	req := map[string]interface{}{}
+	if serviceName != "" {
+		req["service_name"] = serviceName
+	}
+	if serviceEnvironment != "" {
+		req["service_environment"] = serviceEnvironment
+	}
+
+	err := c.Post(ctx, p, req, &resp)
+	return resp, err
 }
 
 func (c *frontClientImpl) GetUser(ctx context.Context) (PostmanUser, error) {

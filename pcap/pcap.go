@@ -4,6 +4,8 @@ import (
 	"net"
 	"time"
 
+	"github.com/akitasoftware/akita-libs/akid"
+	"github.com/akitasoftware/akita-libs/tags"
 	"github.com/akitasoftware/go-utils/optionals"
 	"github.com/google/gopacket"
 	_ "github.com/google/gopacket/layers"
@@ -23,7 +25,10 @@ type pcapWrapper interface {
 	getInterfaceAddrs(interfaceName string) ([]net.IP, error)
 }
 
-type pcapImpl struct{}
+type pcapImpl struct {
+	ServiceID akid.ServiceID
+	TraceTags map[tags.Key]string
+}
 
 func (p *pcapImpl) capturePackets(done <-chan struct{}, interfaceName, bpfFilter string, targetNetworkNamespaceOpt optionals.Optional[string]) (<-chan gopacket.Packet, error) {
 	handle, err := GetPcapHandle(interfaceName, defaultSnapLen, true, BlockForever, targetNetworkNamespaceOpt)
@@ -55,20 +60,36 @@ func (p *pcapImpl) capturePackets(done <-chan struct{}, interfaceName, bpfFilter
 		}()
 
 		startTime := time.Now()
-		count := 0
+		firstPacket := true
+		bufferTimeSum := 0 * time.Second
+		intervalLength := 1 * time.Minute
 		for {
 			select {
 			case <-done:
 				return
 			case pkt, ok := <-pktChan:
 				if ok {
+					now := time.Now()
+					if now.Sub(startTime) >= intervalLength {
+						bufferLength := float64(bufferTimeSum.Nanoseconds()) / float64(intervalLength.Nanoseconds())
+						podName, ok := p.TraceTags[tags.XAkitaKubernetesPod]
+						if !ok {
+							podName = "unknown"
+						}
+						printer.Debugf("Approximate captured-packets buffer length: %v, for svc %v and pod: %v\n", bufferLength, p.ServiceID, podName)
+						bufferTimeSum = 0 * time.Second
+						startTime = now
+					}
+					bufferTimeSum += now.Sub(pkt.Metadata().Timestamp)
+
 					wrappedChan <- pkt
 
-					if count == 0 {
+					if firstPacket {
+						firstPacket = false
 						ttfp := time.Since(startTime)
 						printer.Debugf("Time to first packet on %s: %s\n", interfaceName, ttfp)
 					}
-					count += 1
+
 				} else {
 					return
 				}
